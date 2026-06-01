@@ -3,10 +3,12 @@ const QA = require('../models/QA');
 const DocumentChunk = require('../models/DocumentChunk');
 const ChatHistory = require('../models/ChatHistory');
 const { normalizeText } = require('../models/QA');
+const asyncHandler = require('../utils/asyncHandler');
+const env = require('../config/env');
 
 let groq = null;
-if (process.env.GROQ_API_KEY && !process.env.GROQ_API_KEY.includes('your_groq_api_key')) {
-  groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+if (env.GROQ_API_KEY && !env.GROQ_API_KEY.includes('your_groq_api_key')) {
+  groq = new Groq({ apiKey: env.GROQ_API_KEY });
   console.log('Groq SDK initialized.');
 } else {
   console.warn('WARNING: GROQ_API_KEY not configured.');
@@ -110,172 +112,155 @@ const searchChunks = async (question) => {
   return chunks;
 };
 
-const queryChatbot = async (req, res) => {
+const queryChatbot = asyncHandler(async (req, res) => {
   const { question, sessionId } = req.body;
 
-  try {
-    if (!question || typeof question !== 'string' || !question.trim()) {
-      return res.status(400).json({ success: false, message: 'Please provide a question.' });
-    }
+  if (!question || typeof question !== 'string' || !question.trim()) {
+    res.status(400);
+    throw new Error('Please provide a question.');
+  }
 
-    const trimmed = question.trim();
+  const trimmed = question.trim();
 
-    let previousMessages = [];
-    if (sessionId) {
-      const history = await ChatHistory.find({ sessionId }).sort({ createdAt: 1 }).lean();
-      history.forEach(h => {
-        previousMessages.push({ role: 'user', content: h.question });
-        previousMessages.push({ role: 'assistant', content: h.answer });
-      });
-    }
+  let previousMessages = [];
+  if (sessionId) {
+    const history = await ChatHistory.find({ sessionId }).sort({ createdAt: 1 }).lean();
+    history.forEach(h => {
+      previousMessages.push({ role: 'user', content: h.question });
+      previousMessages.push({ role: 'assistant', content: h.answer });
+    });
+  }
 
-    const normalizedQ = normalizeText(trimmed);
-    let matchedQA = await QA.findOne({ normalizedQuestion: normalizedQ }).lean();
+  const normalizedQ = normalizeText(trimmed);
+  let matchedQA = await QA.findOne({ normalizedQuestion: normalizedQ }).lean();
 
-    if (!matchedQA) {
-      const escaped = trimmed.replace(/[/\-\\^$*+?.()|[\]{}]/g, '\\$&');
-      matchedQA = await QA.findOne(
-        { question: { $regex: new RegExp(escaped, 'i') } }
-      ).lean();
-    }
+  if (!matchedQA) {
+    const escaped = trimmed.replace(/[/\-\\^$*+?.()|[\]{}]/g, '\\$&');
+    matchedQA = await QA.findOne(
+      { question: { $regex: new RegExp(escaped, 'i') } }
+    ).lean();
+  }
 
-    if (matchedQA) {
-      const log = await ChatHistory.create({
-        question: trimmed,
-        answer: matchedQA.answer,
-        source: 'qa',
-        sessionId: sessionId || null,
-        userId: req.user?._id || null
-      });
-      return res.json({ success: true, answer: matchedQA.answer, source: 'qa', chatId: log._id });
-    }
-
-    const wordCount = trimmed.split(/\s+/).length;
-    const isShortFollowUp = wordCount <= 6;
-    const isGreeting = /^(hi|hello|hey|greetings|good morning|good afternoon|good evening)\b/i.test(trimmed);
-
-    let searchStr = trimmed;
-    
-    if (isShortFollowUp && previousMessages.length > 0 && groq) {
-      try {
-        const minContext = previousMessages.slice(-2).map(m => `${m.role === 'user' ? 'User' : 'Bot'}: ${m.content}`).join('\n');
-        
-        const reformulatePrompt = `You are a search query generator. Based on this short conversation context, rewrite the final user message into a standalone search query to find the relevant document in our database. Do not answer the question. Only output the search terms.\n\nContext:\n${minContext}\n\nFinal User message: ${trimmed}\n\nStandalone Search query:`;
-
-        const reformulateCompletion = await groq.chat.completions.create({
-          model: 'llama-3.3-70b-versatile',
-          temperature: 0,
-          max_tokens: 30, 
-          messages: [{ role: 'user', content: reformulatePrompt }]
-        });
-        
-        searchStr = reformulateCompletion.choices[0]?.message?.content?.trim() || trimmed;
-        searchStr = searchStr.replace(/^["']|["']$/g, ''); // Strip accidental quotes outputted by LLM
-        
-        console.log(`[Reformulated Query] Original: "${trimmed}" -> New: "${searchStr}"`);
-      } catch (err) {
-        console.error('Reformulation error:', err.message);
-        searchStr = previousMessages[previousMessages.length - 1].content.slice(-100) + " " + trimmed; // Fallback
-      }
-    } else if (isShortFollowUp && previousMessages.length > 0) {
-      searchStr = previousMessages[previousMessages.length - 1].content.slice(-100) + " " + trimmed;
-    }
-
-    const chunks = await searchChunks(searchStr);
-    let answer = '';
-    let source = '';
-
-    if (isGreeting && chunks.length === 0) {
-      answer = "Hello! How can I help you today?";
-      source = 'documents';
-    } else if (chunks.length > 0 || (previousMessages.length > 0 && isShortFollowUp)) {
-      const contextBlock = chunks.length > 0
-        ? chunks.map((c, i) => `[Excerpt ${i + 1}]\n${c.text.trim()}`).join('\n\n')
-        : '(no direct text match found for this reply)';
-        
-      let userMessage = `KNOWLEDGE BASE CONTEXT:\n${contextBlock}\n\n───────────────────\nCustomer message: ${trimmed}`;
-      userMessage += `\n\nCRITICAL INSTRUCTION: If the customer asks for facts, numbers, trivia, geography, or general knowledge that is NOT explicitly written in the KNOWLEDGE BASE CONTEXT above, you MUST say EXACTLY: "I couldn't find enough information in the uploaded knowledge base to answer that question." OUTSIDE KNOWLEDGE IS FORBIDDEN. ` +
-        (chunks.length === 0 
-          ? `You have 0 documents to reference. If they are just replying conversationally (e.g. "yes", "thank you"), respond naturally.` 
-          : `Base your answer ONLY on the provided excerpts.`);
-      if (groq) {
-        try {
-          const completion = await groq.chat.completions.create({
-            model: 'llama-3.3-70b-versatile',
-            temperature: 0.0,
-            max_tokens: 700,
-            messages: [
-              { role: 'system', content: MASTER_SYSTEM_PROMPT },
-              ...previousMessages,
-              { role: 'user', content: userMessage }
-            ]
-          });
-          answer = completion.choices[0]?.message?.content?.trim() || '';
-          
-          const isFallback = answer === "I couldn't find enough information in the uploaded knowledge base to answer that question.";
-            
-          source = isFallback ? 'fallback' : 'documents';
-
-        } catch (groqErr) {
-          console.error('Groq error:', groqErr.message);
-          answer = chunks.length > 0 ? `Here's what I found:\n\n${chunks[0].text}` : "I couldn't find enough information in the uploaded knowledge base to answer that question.";
-          source = 'documents';
-        }
-      } else {
-        answer = chunks.length > 0 ? `Here's the closest info I found:\n\n${chunks[0].text}` : "I couldn't find enough information in the uploaded knowledge base to answer that question.";
-        source = 'documents';
-      }
-    } else {
-      answer = "I couldn't find enough information in the uploaded knowledge base to answer that question.";
-      source = 'fallback';
-    }
-
+  if (matchedQA) {
     const log = await ChatHistory.create({
       question: trimmed,
-      answer,
-      source,
+      answer: matchedQA.answer,
+      source: 'qa',
       sessionId: sessionId || null,
       userId: req.user?._id || null
     });
-
-    res.json({
-      success: true,
-      answer,
-      source,
-      chatId: log._id,
-    });
-
-  } catch (err) {
-    console.error('Chat query error:', err.message);
-    res.status(500).json({ success: false, message: 'Something went wrong. Please try again.' });
+    return res.json({ success: true, answer: matchedQA.answer, source: 'qa', chatId: log._id });
   }
-};
 
-const getChatHistory = async (req, res) => {
-  try {
-    const history = await ChatHistory.find().sort({ createdAt: -1 }).limit(2000).lean();
-    res.json({ success: true, count: history.length, data: history });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Error retrieving chat history' });
-  }
-};
+  const wordCount = trimmed.split(/\s+/).length;
+  const isShortFollowUp = wordCount <= 6;
+  const isGreeting = /^(hi|hello|hey|greetings|good morning|good afternoon|good evening)\b/i.test(trimmed);
 
-const getUserChatHistory = async (req, res) => {
-  try {
-    const history = await ChatHistory.find({ userId: req.user._id }).sort({ createdAt: -1 }).lean();
-    res.json({ success: true, count: history.length, data: history });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Error retrieving user chat history' });
-  }
-};
+  let searchStr = trimmed;
+  
+  if (isShortFollowUp && previousMessages.length > 0 && groq) {
+    try {
+      const minContext = previousMessages.slice(-2).map(m => `${m.role === 'user' ? 'User' : 'Bot'}: ${m.content}`).join('\n');
+      
+      const reformulatePrompt = `You are a search query generator. Based on this short conversation context, rewrite the final user message into a standalone search query to find the relevant document in our database. Do not answer the question. Only output the search terms.\n\nContext:\n${minContext}\n\nFinal User message: ${trimmed}\n\nStandalone Search query:`;
 
-const clearChatHistory = async (req, res) => {
-  try {
-    await ChatHistory.deleteMany();
-    res.json({ success: true, message: 'Chat history cleared.' });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Error clearing history' });
+      const reformulateCompletion = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        temperature: 0,
+        max_tokens: 30, 
+        messages: [{ role: 'user', content: reformulatePrompt }]
+      });
+      
+      searchStr = reformulateCompletion.choices[0]?.message?.content?.trim() || trimmed;
+      searchStr = searchStr.replace(/^["']|["']$/g, ''); // Strip accidental quotes outputted by LLM
+      
+      console.log(`[Reformulated Query] Original: "${trimmed}" -> New: "${searchStr}"`);
+    } catch (err) {
+      console.error('Reformulation error:', err.message);
+      searchStr = previousMessages[previousMessages.length - 1].content.slice(-100) + " " + trimmed; // Fallback
+    }
+  } else if (isShortFollowUp && previousMessages.length > 0) {
+    searchStr = previousMessages[previousMessages.length - 1].content.slice(-100) + " " + trimmed;
   }
-};
+
+  const chunks = await searchChunks(searchStr);
+  let answer = '';
+  let source = '';
+
+  if (isGreeting && chunks.length === 0) {
+    answer = "Hello! How can I help you today?";
+    source = 'documents';
+  } else if (chunks.length > 0 || (previousMessages.length > 0 && isShortFollowUp)) {
+    const contextBlock = chunks.length > 0
+      ? chunks.map((c, i) => `[Excerpt ${i + 1}]\n${c.text.trim()}`).join('\n\n')
+      : '(no direct text match found for this reply)';
+      
+    let userMessage = `KNOWLEDGE BASE CONTEXT:\n${contextBlock}\n\n───────────────────\nCustomer message: ${trimmed}`;
+    userMessage += `\n\nCRITICAL INSTRUCTION: If the customer asks for facts, numbers, trivia, geography, or general knowledge that is NOT explicitly written in the KNOWLEDGE BASE CONTEXT above, you MUST say EXACTLY: "I couldn't find enough information in the uploaded knowledge base to answer that question." OUTSIDE KNOWLEDGE IS FORBIDDEN. ` +
+      (chunks.length === 0 
+        ? `You have 0 documents to reference. If they are just replying conversationally (e.g. "yes", "thank you"), respond naturally.` 
+        : `Base your answer ONLY on the provided excerpts.`);
+    if (groq) {
+      try {
+        const completion = await groq.chat.completions.create({
+          model: 'llama-3.3-70b-versatile',
+          temperature: 0.0,
+          max_tokens: 700,
+          messages: [
+            { role: 'system', content: MASTER_SYSTEM_PROMPT },
+            ...previousMessages,
+            { role: 'user', content: userMessage }
+          ]
+        });
+        answer = completion.choices[0]?.message?.content?.trim() || '';
+        
+        const isFallback = answer === "I couldn't find enough information in the uploaded knowledge base to answer that question.";
+          
+        source = isFallback ? 'fallback' : 'documents';
+
+      } catch (groqErr) {
+        console.error('Groq error:', groqErr.message);
+        answer = chunks.length > 0 ? `Here's what I found:\n\n${chunks[0].text}` : "I couldn't find enough information in the uploaded knowledge base to answer that question.";
+        source = 'documents';
+      }
+    } else {
+      answer = chunks.length > 0 ? `Here's the closest info I found:\n\n${chunks[0].text}` : "I couldn't find enough information in the uploaded knowledge base to answer that question.";
+      source = 'documents';
+    }
+  } else {
+    answer = "I couldn't find enough information in the uploaded knowledge base to answer that question.";
+    source = 'fallback';
+  }
+
+  const log = await ChatHistory.create({
+    question: trimmed,
+    answer,
+    source,
+    sessionId: sessionId || null,
+    userId: req.user?._id || null
+  });
+
+  res.json({
+    success: true,
+    answer,
+    source,
+    chatId: log._id,
+  });
+});
+
+const getChatHistory = asyncHandler(async (req, res) => {
+  const history = await ChatHistory.find().sort({ createdAt: -1 }).limit(2000).lean();
+  res.json({ success: true, count: history.length, data: history });
+});
+
+const getUserChatHistory = asyncHandler(async (req, res) => {
+  const history = await ChatHistory.find({ userId: req.user._id }).sort({ createdAt: -1 }).lean();
+  res.json({ success: true, count: history.length, data: history });
+});
+
+const clearChatHistory = asyncHandler(async (req, res) => {
+  await ChatHistory.deleteMany();
+  res.json({ success: true, message: 'Chat history cleared.' });
+});
 
 module.exports = { queryChatbot, getChatHistory, clearChatHistory, getUserChatHistory };

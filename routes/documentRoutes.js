@@ -1,10 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const { uploadDocument, getDocuments, deleteDocument } = require('../controllers/documentController');
-const { protect } = require('../middleware/authMiddleware');
+const { authenticate, authorize } = require('../middleware/authMiddleware');
 const upload = require('../middleware/uploadMiddleware');
 
-router.use(protect);
+router.use(authenticate, authorize('admin'));
 
 router.post('/upload', upload.single('file'), uploadDocument);
 router.get('/', getDocuments);

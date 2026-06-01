@@ -6,7 +6,11 @@ const chunkText = (text, chunkSize = 500, overlap = 80) => {
 
   const chunks = [];
   let start = 0;
-  const step = chunkSize - overlap; n
+  const step = chunkSize - overlap;
+
+  if (step <= 0) {
+      throw new Error('Chunk overlap cannot be greater than or equal to chunk size');
+  }
 
   while (start < clean.length) {
     let end = start + chunkSize;
@@ -25,7 +29,6 @@ const chunkText = (text, chunkSize = 500, overlap = 80) => {
     }
 
     start += step;
-    if (step <= 0) break;
   }
 
   return chunks;

@@ -1,123 +1,99 @@
 const User = require('../models/User');
-const jwt = require('jsonwebtoken');
+const generateToken = require('../utils/generateToken');
+const asyncHandler = require('../utils/asyncHandler');
 
-const generateToken = (id) => {
-  return jwt.sign({ id }, process.env.JWT_SECRET || 'supersecretjwtkey12345!', {
-    expiresIn: '30d',
+const loginUser = asyncHandler(async (req, res) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    res.status(400);
+    throw new Error('Please provide username and password');
+  }
+
+  const user = await User.findOne({ username }).select('+password');
+  if (!user || !(await user.comparePassword(password))) {
+    res.status(401);
+    throw new Error('Invalid credentials');
+  }
+
+  res.json({
+    success: true,
+    token: generateToken(user._id, user.role, user.username),
+    user: {
+      id: user._id,
+      username: user.username,
+      role: user.role
+    }
   });
-};
-const loginUser = async (req, res) => {
+});
+
+const registerUser = asyncHandler(async (req, res) => {
   const { username, password } = req.body;
 
-  try {
-    if (!username || !password) {
-      return res.status(400).json({ success: false, message: 'Please provide username and password' });
-    }
-    const user = await User.findOne({ username });
-    if (!user) {
-      return res.status(401).json({ success: false, message: 'Invalid credentials' });
-    }
-    const isMatch = await user.comparePassword(password);
-    if (!isMatch) {
-      return res.status(401).json({ success: false, message: 'Invalid credentials' });
-    }
-
-    res.json({
-      success: true,
-      token: generateToken(user._id),
-      user: {
-        id: user._id,
-        username: user.username,
-        role: user.role
-      }
-    });
-  } catch (error) {
-    console.error('Login error:', error.message);
-    res.status(500).json({ success: false, message: 'Server error during login' });
+  if (!username || !password) {
+    res.status(400);
+    throw new Error('Please provide username and password');
   }
-};
 
-const registerUser = async (req, res) => {
-  const { username, password } = req.body;
-
-  try {
-    if (!username || !password) {
-      return res.status(400).json({ success: false, message: 'Please provide username and password' });
-    }
-
-    const userExists = await User.findOne({ username });
-    if (userExists) {
-      return res.status(400).json({ success: false, message: 'Username is already taken' });
-    }
-
-    const user = await User.create({
-      username,
-      password,
-      role: 'user'
-    });
-
-    res.status(201).json({
-      success: true,
-      token: generateToken(user._id),
-      user: {
-        id: user._id,
-        username: user.username,
-        role: user.role
-      }
-    });
-  } catch (error) {
-    console.error('Registration error:', error.message);
-    res.status(500).json({ success: false, message: 'Server error during registration' });
+  const userExists = await User.findOne({ username });
+  if (userExists) {
+    res.status(400);
+    throw new Error('Username is already taken');
   }
-};
-const getProfile = async (req, res) => {
+
+  const user = await User.create({
+    username,
+    password,
+    role: 'user'
+  });
+
+  res.status(201).json({
+    success: true,
+    token: generateToken(user._id, user.role, user.username),
+    user: {
+      id: user._id,
+      username: user.username,
+      role: user.role
+    }
+  });
+});
+
+const getProfile = asyncHandler(async (req, res) => {
   res.json({
     success: true,
     user: req.user
   });
-};
-const loginAdmin = async (req, res) => {
+});
+
+const loginAdmin = asyncHandler(async (req, res) => {
   const { username, password } = req.body;
 
-  try {
-    if (!username || !password) {
-      return res.status(400).json({ success: false, message: 'Please provide username and password' });
-    }
-
-    const user = await User.findOne({ username });
-    if (!user || user.role !== 'admin') {
-      return res.status(401).json({ success: false, message: 'Invalid admin credentials' });
-    }
-
-    const isMatch = await user.comparePassword(password);
-    if (!isMatch) {
-      return res.status(401).json({ success: false, message: 'Invalid admin credentials' });
-    }
-
-    res.json({
-      success: true,
-      token: generateToken(user._id),
-      user: {
-        id: user._id,
-        username: user.username,
-        role: user.role
-      }
-    });
-  } catch (error) {
-    console.error('Admin Login error:', error.message);
-    res.status(500).json({ success: false, message: 'Server error during admin login' });
+  if (!username || !password) {
+    res.status(400);
+    throw new Error('Please provide username and password');
   }
-};
 
-const getTotalUsers = async (req, res) => {
-  try {
-    const count = await User.countDocuments({ role: 'user' });
-    res.json({ success: true, count });
-  } catch (error) {
-    console.error('Fetch total users error:', error.message);
-    res.status(500).json({ success: false, message: 'Server error' });
+  const user = await User.findOne({ username }).select('+password');
+  if (!user || user.role !== 'admin' || !(await user.comparePassword(password))) {
+    res.status(401);
+    throw new Error('Invalid admin credentials');
   }
-};
+
+  res.json({
+    success: true,
+    token: generateToken(user._id, user.role, user.username),
+    user: {
+      id: user._id,
+      username: user.username,
+      role: user.role
+    }
+  });
+});
+
+const getTotalUsers = asyncHandler(async (req, res) => {
+  const count = await User.countDocuments({ role: 'user' });
+  res.json({ success: true, count });
+});
 
 module.exports = {
   loginUser,
